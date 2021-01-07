@@ -1,0 +1,295 @@
+---
+title: "proteomic_analysis"
+author: "Roos"
+date: "24 March 2020"
+output: html_document
+---
+
+
+Start packages
+```{r}
+
+library(devtools)
+library(rafalib)
+library(readxl)
+library(dplyr)
+library(DESeq2)
+library(pvclust)
+library(tidyverse)
+library(UpSetR)
+library(basicPlotteR)
+
+```
+
+
+Read in files, only the tab that has the quantified data
+```{r}
+
+#import data & metadata
+data <- read_excel("C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/data/EV_GeneCentricData_20200429.xlsx", sheet = 1, col_types = c(rep("text", times=4) , rep("numeric", times=46) ))
+
+metadata <- read.csv("C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/data/metadata_script2.csv", header = TRUE, stringsAsFactors = TRUE)
+rownames(metadata) <- metadata$sample_name
+
+#clean up data table
+data1 <- data[, c(-1,-3,-4)]
+data1 <- as.data.frame(data1)
+
+#For the rest of the analysis I've removed the batch 10 & 11 from the ExoEasy MM6 samples as they were just there to test for batch effect (script 1, PCA)
+
+colnames(data1)
+removecol <- c("_MM6_exoEasy_S34.raw_MS1 precursor area", "_MM6_exoEasy_S35.raw_MS1 precursor area", "Antal")
+
+data2 <- data1[, !(colnames(data1)%in%removecol)]
+colnames(data2)
+
+#check for duplications in Gene Name and if any, remove the lowest expressed ones
+if(any(duplicated(data2$`Gene Name`))) {
+ duprow <- which(duplicated(data2$`Gene Name`))
+ duprow <- data2[duprow, "Gene Name"]
+ duprowtable <-data2[data2$`Gene Name`%in%duprow,]
+ duprowtable[,"total_peak"] <- rowSums(as.matrix(duprowtable[,-1]), na.rm = TRUE)
+}
+
+#There are 2 duplicates, keep row 1610 and 1914 and remove 1228 and 1751
+data2 <- data2[c(-1228, -1751),]
+data2 <- data.frame(data2[,-1], row.names =data2$`Gene Name`)
+
+#check if there is any NA in the data,if so replace with 0, also check if there are rows that have 0 for every sample, since we removed some samples now, these are not neccessary anymore.
+apply(data2, 2, function(x) any(is.na(x)))
+data2[is.na(data2)] <- 0
+
+data2<- data2[rowSums(data2[,-1])>0,]
+length(rownames(data1))
+length(rownames(data2))
+
+#make sure sample names in metadata and data are the same
+colnames(data2) <- metadata$sample_name
+
+```
+
+
+Make count matrix and check multiple normalization methods
+```{r}
+
+allproteins <- rownames(data2)
+
+#make count table with protein names
+counts <- as.matrix(data2)
+counts <- counts[!is.na(rownames(counts)),] # remove any NA's in the row names
+counts <- counts[ sort(rownames(counts)), ] # sort proteins names (rownames) alphabetically
+dim(counts)            
+hist(counts)
+
+#Remove proteins that are expressed in less than 2 samples
+sel <- apply(counts, 1, function(x) {sum(x>=1)>=2})
+counts <- counts[sel,]
+dim(counts)  
+hist(counts)
+allproteins <- rownames(counts)
+
+
+#log normalize counts <----- For this study we used the log2 normalization
+logcounts <- log2(counts+1)
+
+#normalize counts
+sizefact <- colSums(counts)
+normcounts<- log2(t( t(counts)/sizefact) * mean(sizefact) +1)
+hist(normcounts)
+
+#z-score normalisation
+znorm <- t( apply(normcounts , 1 , function(x) scale( x , center = T, scale = T)))
+colnames(znorm) <- colnames(counts)
+hist(znorm)
+
+#check normalised counts
+mypar(3,1)
+
+boxplot( t(logcounts[1:30,]) , ylim=c(-4,60), las=2 , col="grey" , main="log norm" ,cex=.2)
+abline(h=0, col="red" ,lty=2)
+
+boxplot( t(normcounts[1:30,]) , ylim=c(-4,60), las=2 , col="grey" , main="normcount" ,cex=.2)
+abline(h=0, col="red" ,lty=2)
+
+boxplot( t(znorm[1:30,]) , ylim=c(-4,4), las=2 , col="grey" , main="Znorm" ,cex=.2)
+abline(h=0, col="red" ,lty=2)
+
+
+```
+
+
+Make a table with the protein count per method and for each donor/batch. Also export a list of these proteins
+```{r}
+
+proteins_eachmethod <- list()
+
+#make an excel file of all the protein lists
+for(i in metadata$sample_complete){
+  s <- as.character(metadata[metadata$sample_complete==i, "sample_name"])
+  
+ proteins_eachmethod[[i]] <- rownames(logcounts)[rowSums(logcounts[,s])>0]
+ 
+#write.csv(proteins_eachmethod[[i]], paste("C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/ev_isolation/output/script2/ProteinsPresentIn_", metadata[metadata$sample_complete==i, "sample_type"][1], "_", i, ".csv"))
+}
+
+#make an excel file of all the unique proteins identified in each method
+unique_proteins <- list()
+
+for(i in 1:length(proteins_eachmethod)){
+  temp_name <- names(proteins_eachmethod[i])
+  temp_proteins <- proteins_eachmethod[[i]]
+  temp_list <- proteins_eachmethod[-i]
+  unique_proteins[[temp_name]] <-   temp_proteins[!temp_proteins%in%unique(unlist(temp_list))]
+}
+
+unique_proteins1 <- do.call("rbind", lapply(unique_proteins, FUN = as.data.frame))
+#write.csv(unique_proteins, "C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/ev_isolation/output/script2/unique_proteins1.csv")
+  
+#make a table with the protein counts and export
+proteins_number <- matrix(0, nrow=9, ncol=length(proteins_eachmethod), dimnames = list(c("D1", "D2", "D3","Batch 1", "Batch 2", "Batch 3", "Batch 4", "Total identified proteins", "Total unique proteins in this method"),  names(proteins_eachmethod)))
+
+for(j in 1:length(proteins_eachmethod)){
+  proteins_number[8, j] <- length(proteins_eachmethod[[j]])
+}
+
+for(j in 1:length(unique_proteins)){
+  proteins_number[9, j] <- length(unique_proteins[[j]])
+}
+
+for(k in metadata$sample_name ) {
+  l <- count(logcounts[,k]>0)
+  m <- as.character(metadata[metadata$sample_name==k, "donor_code"])
+  n <- as.character(metadata[metadata$sample_name==k, "sample_complete"])
+  
+  proteins_number[m, n] <- l
+}
+
+#write.csv(proteins_number, "C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/ev_isolation/output/script2/Protein_Counts_2.csv")
+
+```
+
+
+
+PCA on all samples together see if there is any outlier and to see if the methods or sample type (plasma vs. supernatant) separate
+```{r}
+
+#select for the most ..... variable proteins
+topvar <- rowVars(logcounts)
+topvar <- setNames(topvar, rownames(logcounts))
+topvar <- sort(topvar, decreasing = T)
+topvarnames <- names(topvar)[1:length(allproteins)] #[1:length(allproteins)] for all proteins
+
+#alternatively use this code:
+#topvar <- rowVars(logcounts)
+#topvar2 <- order(topvar, decreasing =TRUE)[seq_len(min(ntop=800, length(topvar)))]
+
+pc <- prcomp(t(logcounts[topvarnames,]), scale. = T, center = T) 
+
+perc_pc <- summary(pc)$importance[2,]*100
+perc_pc <- round(perc_pc, digits=1)
+
+colourscheme <- (c("deepskyblue4", "plum3"))
+
+
+layout.matrix1 <- matrix(c(1,2,3,4), byrow= TRUE, nrow = 2, ncol = 2)
+#pdf(file="C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/ev_isolation/output/script2/PCA_sampletype_allproteins_2.pdf", width = 8, height = 6, compress = FALSE)
+layout(layout.matrix1, heights = c(2.5,1), widths = c(1,1,1,1))
+par(mar = c(4, 4, 2, 1))
+
+plot(pc$x[,1:2], pch=20, col=colourscheme[c(2, 1)][metadata[rownames(pc$x),"sample_type"]], las=1, cex=2.2, xlab=paste("PC1,", perc_pc[1], "%", sep=" "), ylab=paste("PC2,", perc_pc[2], "%", sep=" "))
+#addTextLabels(pc$x[,1], pc$x[,2], labels = metadata$sample_name, cex.label = 0.5)
+text(pc$x[,1] , pc$x[,2], labels = metadata[rownames(pc$x),"sample_complete"], pos = 3, cex=0.7)
+
+plot(pc$x[,3:4], pch=20, col=colourscheme[c(2,1)][metadata[rownames(pc$x),"sample_type"]], las=1, cex=2.2, xlab=paste("PC3,", perc_pc[3], "%", sep=" "), ylab=paste("PC4,", perc_pc[4], "%", sep=" "))
+#addTextLabels(pc$x[,1], pc$x[,2], labels = metadata$sample_name, cex.label = 0.5)
+text(pc$x[,3] , pc$x[,4], labels = metadata[rownames(pc$x),"sample_complete"], pos = 3, cex=0.7)
+
+mtext(paste("Top",length(topvarnames), sep=" "), outer=TRUE,  cex=1.5, line=-1.5)
+
+par(mar = c(2, 4, 2, 1))
+plot(0, type="n", axes=F, xlab="", ylab="")
+legend("bottom", legend = levels(metadata[rownames(pc$x),"sample_type"]), fill=colourscheme[c(2,1)], cex = 0.7)
+
+#Check PCs
+par(mar = c(4, 4, 2, 1))
+barplot(pc$sdev, names.arg = colnames(pc$x), 
+        las=2, space = 0.5, cex.names= 0.5, cex.main=0.8, cex.axis = 0.8, main="PC variance")
+
+#dev.off()
+
+```
+
+
+
+PCA plasma and supernatant seperatyly to see how the donors and replicates cluster
+```{r}
+
+#select for the most ..... variable proteins for both plasma and supernatant
+pc_sep <- list()
+
+layout.matrix1 <- matrix(c(1,2,3,4), byrow= TRUE, nrow = 2, ncol = 2)
+
+for (i in levels(metadata$sample_type)) {
+temp <- logcounts[,metadata[metadata$sample_type==i, "sample_name"]]
+tempvar <- rowVars(temp)
+tempvar <- setNames(tempvar, rownames(temp))
+tempvar <- sort(tempvar, decreasing = T)
+tempvarnames <- names(tempvar)[tempvar>0]
+
+temppc <- prcomp(t(temp[tempvarnames, ]), scale. = T, center = T) 
+pc_sep[[i]] <- temppc
+
+j <- pc_sep[[i]]
+perc_pc <- summary(j)$importance[2,]*100
+perc_pc <- round(perc_pc, digits=1)
+
+
+if (i == "plasma") {
+colourscheme <- (c( "skyblue3", "skyblue4", "orangered2", "lightgoldenrod2",  "gray65", "darkseagreen3", "darkseagreen4", "gray25", "plum 1", "plum3"))
+}
+else{
+colourscheme <- (c("skyblue3", "orangered2", "lightgoldenrod2", "gray65", "darkseagreen3", "gray25", "mediumpurple3", "plum3"))
+}
+
+#pdf(file=paste0("C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/ev_isolation/output/script2/PCA_donors_", i, "_sepnmethod_2.pdf"), width = 8, height = 6, compress = FALSE)
+
+layout(layout.matrix1, heights = c(1.8,1), widths = c(1,1,1,1))
+par(mar = c(4, 4, 2, 1))
+
+plot(j$x[,1:2], pch=20, col=colourscheme[][factor(metadata[rownames(j$x), "sample_complete"])], las=1, cex=2.6, xlab=paste("PC1,", perc_pc[1], "%", sep=" "), ylab=paste("PC2,", perc_pc[2], "%", sep=" "))
+text(j$x[,1] , j$x[,2], labels = metadata[rownames(j$x), "donor_code"], pos = 3, cex=0.7)
+#addTextLabels(j$x[,1], j$x[,2], labels = metadata[metadata$sample_type==i, "donor_code"], cex.label = 0.8, col.label = "black")
+
+plot(j$x[,c(1,3)], pch=20, col=colourscheme[][factor(metadata[rownames(j$x), "sample_complete"])], las=1, cex=2.6, xlab=paste("PC1,", perc_pc[1], "%", sep=" "), ylab=paste("PC3,", perc_pc[3], "%", sep=" "))
+text(j$x[,1] , j$x[,3], labels = metadata[rownames(j$x), "donor_code"], pos = 3, cex=0.7)
+#addTextLabels(j$x[,3] , j$x[,4], labels = metadata[metadata$sample_type==i, "donor_code"], cex.label = 0.8, col.label = "black")
+
+mtext(paste(i, paste0("Top ",length(tempvarnames)), sep=" "), outer=TRUE,  cex=1.5, line=-1.5)
+    
+par(mar = c(2, 4, 2, 1))
+plot(0, type="n", axes=F, xlab="", ylab="")
+legend("bottom", legend = levels(factor(metadata[rownames(j$x), "sample_complete"])), fill=colourscheme, cex = 0.8)
+
+#Check PCs
+par(mar = c(4, 4, 2, 1))
+barplot(j$sdev, names.arg = colnames(j$x), las=2, space = 0.5, cex.names= 0.5, cex.main=0.8, cex.axis = 0.8, main="PC variance")
+
+#dev.off()    
+}  
+
+```
+
+
+Remove outlier sample if necessary
+```{r eval = FALSE, echo = FALSE}
+
+logcounts <- logcounts[,!(colnames(logcounts) %in% ".....")] #fill in sample name
+dim(logcounts)
+
+metadata <- metadata[!metadata$sample_name==".....",] #fill in sample name
+
+allproteins <- rownames(logcounts)
+
+```
+
+

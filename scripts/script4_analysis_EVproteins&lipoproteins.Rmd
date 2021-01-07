@@ -1,0 +1,393 @@
+
+---
+title: "EV_proteins_enrichment"
+author: "Roos"
+date: "2 June 2020"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+Load packages
+```{r}
+
+library(readxl)
+library(devtools)
+library(rafalib)
+library(dplyr)
+library(msigdbr)
+library(fgsea)
+library(GSEABase)
+library(RColorBrewer)
+library(venn)
+library(VennDiagram)
+library(gridExtra)
+
+```
+
+Read in files, only the tab that has the quantified data
+```{r}
+
+#import data & metadata
+data <- read_excel("C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/data/EV_GeneCentricData_20200429.xlsx", sheet = 1, col_types = c(rep("text", times=4) , rep("numeric", times=46) ))
+
+metadata <- read.csv("C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/data/metadata_script2.csv", header = TRUE, stringsAsFactors = TRUE)
+
+removerow <- c("3ml_Plasma_Izon35FT_ERH", "3ml_Plasma_Izon35FT_OB", "3ml_Plasma_Izon70FT_ERH", "3ml_Plasma_Izon70FT_JGH", "MM6_Izon35FT_#10", "MM6_Izon35FT_#11", "MM6_Izon70FT_#2", "MM6_Izon70FT_#3")
+
+rownames(metadata) <- metadata$sample_name
+metadata <- droplevels(metadata[!rownames(metadata)%in%removerow,])
+
+#clean up data table
+data1 <- data[, c(-1,-3,-4)]
+data1 <- as.data.frame(data1)
+
+#For the rest of the analysis I've removed the flow through samples as they are not EV isolation methods. Also I have removed the batch 10 & 11 from the ExoEasy MM6 samples as they were just there to test for batch effect (supplementary figures, PCA)
+
+colnames(data1)
+removecol <- c("_3ml_Plasma_Izon35FT_ERH_S29.raw_MS1 precursor area", "_3ml_Plasma_Izon35FT_OB_S28.raw_MS1 precursor area", "_3ml_Plasma_IzonFT_ERH_S24.raw_MS1 precursor area", "_3ml_Plasma_IzonFT_JGH_S25.raw_MS1 precursor area", "_MM6_Izon35FT_S46.raw_MS1 precursor area", "_MM6_Izon35FT_S47.raw_MS1 precursor area", "_MM6_IzonFT_S42.raw_MS1 precursor area", "_MM6_IzonFT_S43.raw_MS1 precursor area" , "_MM6_exoEasy_S34.raw_MS1 precursor area", "_MM6_exoEasy_S35.raw_MS1 precursor area", "Antal")
+
+data2 <- data1[, !(colnames(data1)%in%removecol)]
+colnames(data2)
+
+#check for duplications in Gene Name and if any, remove the lowest expressed ones
+if(any(duplicated(data2$`Gene Name`))) {
+ duprow <- which(duplicated(data2$`Gene Name`))
+ duprow <- data2[duprow, "Gene Name"]
+ duprowtable <-data2[data2$`Gene Name`%in%duprow,]
+ duprowtable[,"total_peak"] <- rowSums(as.matrix(duprowtable[,-1]), na.rm = TRUE)
+}
+
+#There are 2 duplicates, keep row 1610 and 1914 and remove 1228 and 1751
+data2 <- data2[c(-1228, -1751),]
+data2 <- data.frame(data2[,-1], row.names =data2$`Gene Name`)
+
+#check if there is any NA in the data,if so replace with 0, also check if there are rows that have 0 for every sample, since we removed some samples now, these are not neccessary anymore.
+apply(data2, 2, function(x) any(is.na(x)))
+data2[is.na(data2)] <- 0
+
+data2<- data2[rowSums(data2[,-1])>0,]
+length(rownames(data1))
+length(rownames(data2))
+
+#make sure sample names in metadata and data are the same
+colnames(data2) <- metadata$sample_name
+
+```
+
+
+Make count matrix and use log2 normalization
+```{r}
+allproteins <- rownames(data2)
+
+#make count table with protein names
+counts <- as.matrix(data2)
+                          
+counts <- counts[!is.na(rownames(counts)),] # remove any NA's in the row names
+counts <- counts[ sort(rownames(counts)), ] # sort proteins names (rownames) alphabetically
+dim(counts)            
+hist(counts)
+
+#Remove proteins that are expressed in only 1 sample (so cut-off is at present in at least 2 samples)
+sel <- apply(counts, 1, function(x) {sum(x>=5)>=2})
+counts <- counts[sel,]
+dim(counts)  
+hist(counts)
+allproteins <- rownames(counts)
+
+#log normalize counts
+logcounts <- log2(counts+1)
+hist(logcounts)
+
+mypar(1,1)
+
+boxplot( t(logcounts[1:50,]) , ylim=c(-4,60), las=2 , col="grey" , main="log norm" ,cex=.2)
+abline(h=0, col="red" ,lty=2)
+
+```
+
+
+Import data from vesiclepedia (text-file based) (I downloaded Version 4.1, 2018-08-15)
+```{r}
+#read in the text file
+ev_proteins <- read.delim("C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/data/VESICLEPEDIA_PROTEIN_MRNA_DETAILS_4.1.txt", header = TRUE, sep = "\t")
+
+#select only for homosapiens
+ev_proteins <- ev_proteins[ev_proteins$SPECIES=="Homo sapiens",]
+
+#take only proteins and not mRNA
+ev_proteins<- ev_proteins[ev_proteins$CONTENT.TYPE=="protein",]
+
+#remove duplicate proteins
+ev_proteins<- ev_proteins[!duplicated(ev_proteins$GENE.SYMBOL),]
+ev_proteins[unique(ev_proteins$GENE.SYMBOL),]
+
+ev_proteins_100 <- read.delim("C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/data/EV_TOP_100.txt", header = TRUE, sep = "\t")  
+```
+
+
+Import plasma protein list
+```{r}
+
+plasma_proteins <- read.csv("C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/data/Plasma_proteins_200923.csv")
+plasma_proteins <- as.character(unlist(plasma_proteins$Gene.name))
+
+light_chains <- grep("IGLV|IGKV", rownames(logcounts), value = TRUE)
+plasma_proteins<- c(plasma_proteins,light_chains)
+
+#write.csv(plasma_proteins, "C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/data/Plasma_proteins_updated.csv")
+
+```
+
+Import the ontology gene sets from gsea-misigdb.org, C5 GO cellular compartments
+```{r}
+
+GO_pathways <- fgsea::gmtPathways("C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/data/c5.go.cc.v7.2.symbols.gmt")
+
+GO_proteins <- list()
+GO_pathways_used <- list()
+
+search_terms <- c(ESCRT_multivesicular = "ESCRT|multivesicular", endosome = "endosome", golgi = "golgi", mitochondria = "mitochondria", plasma_membrane = "plasma_membrane", vesicle_pathway = "vesicle", endoplasmic_reticulum = "GO_ENDOPLASMIC_RETICULUM_LUMEN|GO_SMOOTH_ENDOPLASMIC_RETICULUM_MEMBRANE|GO_ROUGH_ENDOPLASMIC_RETICULUM_MEMBRANE|GO_INTRINSIC_COMPONENT_OF_ENDOPLASMIC_RETICULUM_MEMBRANE|GO_EXTRINSIC_COMPONENT_OF_ENDOPLASMIC_RETICULUM_MEMBRANE|GO_LUMENAL_SIDE_OF_ENDOPLASMIC_RETICULUM_MEMBRANE|GO_CYTOPLASMIC_SIDE_OF_ENDOPLASMIC_RETICULUM_MEMBRANE", cytoskeleton = "cytoskeleton", nucleus = "nuclear", RNA_binding = "rna|mrna|mirna")
+
+
+for (i in search_terms){
+  x <- names(search_terms[search_terms%in%i])
+  y <- GO_pathways[grepl(i, names(GO_pathways), ignore.case = TRUE)]
+  
+  if(i == "plasma_membrane") {
+    y <- y[!grepl("SPERM", names(y), ignore.case = TRUE)]
+  } else if(i == "vesicle") {
+    y <- y[!grepl("neur|copi|golgi|acros|cytoskeleton", names(y), ignore.case = TRUE)]
+  } else if (i== "nuclear") {
+    y <- y[!grepl("ENDOPLASMIC_RETICULUM|exosome", names(y), ignore.case = TRUE)]
+  } else if (i== "rna|mrna|mirna") {
+    y <- y[!grepl("plasma_membrane|golgi|trna", names(y), ignore.case = TRUE)]
+  }
+  
+  GO_proteins[[x]] <- unique(unlist(y))
+  GO_pathways_used[[x]] <- names(y)
+  
+}
+
+#pathways_lipid <- fgsea::gmtPathways("C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/data/c5.go.cc.v7.2.symbols.gmt")
+#pathways_lipid <- pathways_lipid[grep("LIPOPROTEIN_PARTICLE", names(pathways_lipid))]
+#pathways_lipid <- unlist(pathways_lipid)
+
+#GO_pathways_used <- do.call("rbind", lapply(GO_pathways_used[], as.data.frame))
+#write.csv(GO_pathways_used, "C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/ev_isolation/output/script4/GO_pathways_as_criteria.csv")
+
+```
+
+
+Match the identified proteins/sample with the Vesiclepedia proteins
+```{r}
+
+proteins_eachmethod <- list()
+
+#make a list with the indentified proteins for each method and volume
+for(i in metadata$sample_complete){
+  s <- as.character(metadata[metadata$sample_complete==i, "sample_name"])
+  proteins_eachmethod[[i]] <- rownames(logcounts)[rowSums(logcounts[,s])>0]
+}
+
+proteinlist <- list()
+proteinlist[["detected proteins"]] <- rownames(logcounts)
+proteinlist[["vesiclepedia protein"]] <- as.character(ev_proteins$GENE.SYMBOL)
+proteinlist[["vesiclepdia top 100"]] <- as.character(ev_proteins_100$GENE.SYMBOL)
+proteinlist[["plasma proteins"]] <- plasma_proteins
+proteinlist[["GO EV proteins"]] <- c(GO_proteins[["vesicle_pathway"]], GO_proteins[["ESCRT_multivesicular"]])
+
+#write.csv(proteinlist[["GO EV proteins"]], "C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/ev_isolation/output/GO-Proteins.csv")
+
+```
+
+
+Make venn diagram for overlapping proteins between our detected proteins and Vesiclepedia top 100 and the EV proteins from the EV proteins from the GO pathways: vesicle_pathway, ESCRT and MVB. 
+```{r}
+#make a venn diagram and get the proteins that are present in each intersection
+tmp <- venn(proteinlist[c("detected proteins", "vesiclepedia protein")], ilabels = TRUE)
+insect <- attr(tmp, "intersection")
+
+tmp2 <- venn(proteinlist[c("detected proteins", "vesiclepdia top 100")])
+insect2 <- attr(tmp2, "intersection")
+
+tmp3 <- venn(proteinlist[c("vesiclepdia top 100", "plasma proteins")])
+insect3 <- attr(tmp3, "intersection")
+
+tmp4 <- venn(proteinlist[c("detected proteins", "GO EV proteins")])
+insect4 <- attr(tmp4, "intersection")
+
+tmp5 <- venn(proteinlist[c("GO EV proteins", "plasma proteins")])
+insect5 <- attr(tmp5, "intersection")
+
+proteins_notdescribedbefore <- insect[["detected proteins"]]
+detected_proteins_currentstudy_vesiclepdia100 <- insect2[["detected proteins:vesiclepdia top 100"]]
+undetected_proteins_currentstudy_vesiclepdia100 <- insect2[["vesiclepdia top 100"]]
+plasma_proteins_vesiclepdia100 <- insect3[["vesiclepdia top 100:plasma proteins"]]
+detected_proteins_currentstudy_GOproteins <- insect4[["detected proteins:GO EV proteins"]]
+undetected_proteins_currentstudy_GOproteins <- insect4[["GO EV proteins"]]
+
+#I want to see which proteins in our home-made list are present and not present in our data (all isolation methods together, cut off >=2)
+
+#write.csv(proteins_notdescribedbefore, "C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/ev_isolation/output/script4/proteins_not_described_before.csv")
+#write.csv(detected_proteins_currentstudy_vesiclepdia100, "C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/ev_isolation/output/script4/proteins_presentVESICLEPEDIA100_and_currentstudy.csv")
+#write.csv(undetected_proteins_currentstudy_vesiclepdia100, "C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/ev_isolation/output/script4/proteins_present_Vesiclepedia100_not_currentstudy.csv")
+#write.csv(detected_proteins_currentstudy_GOproteins, "C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/ev_isolation/output/script4/proteins_present_GOproteins_and_currentstudy.csv")
+#write.csv(undetected_proteins_currentstudy_GOproteins, "C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/ev_isolation/output/script4/proteins_present_GOproteins_not_currentstudy.csv")
+
+
+#use these function to plot the venn diagrams (instead of the venn function which is a bit limited)
+
+vennplot1 <- draw.pairwise.venn(area1 = length(proteinlist[["detected proteins"]]), area2 = length(proteinlist[["vesiclepedia protein"]]), cross.area = length(insect$"detected proteins:vesiclepedia protein"), category = c("Detected proteins in this study", "Proteins described in Vesiclepedia database"), lwd= c(7,7), lty = c(1, 1), col = c("darkorange3", "paleturquoise3"), alpha = rep(0.4, 1), cat.pos = c(520,170), cat.dist = rep(0.04, 1), cex =2, cat.cex = 2.2,  ext.pos =140, ext.length= 0.70, ext.dist = 0.005)
+
+vennplot2 <- draw.pairwise.venn(area1 = length(proteinlist[["detected proteins"]]), area2 = length(proteinlist[["vesiclepdia top 100"]]), cross.area = length(insect2$"detected proteins:vesiclepdia top 100"), category = c("Detected proteins in this study", "Top 100 EV proteins in Vesiclepedia database"), lwd= c(7,7), lty = c(1, 1), col = c("darkorange3", "paleturquoise3"), alpha = rep(0.4, 1), cat.pos = c(340,330), cat.dist = rep(0.04, 1), cex =2, cat.cex = 2.2,  ext.pos =140, ext.length= 0.70, ext.dist = 0.005)
+
+vennplot3 <- draw.pairwise.venn(area1 = length(proteinlist[["detected proteins"]]), area2 = length(proteinlist[["GO EV proteins"]]), cross.area = length(insect4$"detected proteins:GO EV proteins"), category = c("Detected proteins in this study", "Proteins described GO EV pathways"), lwd= c(7,7), lty = c(1, 1), col = c("darkorange3", "paleturquoise3"), alpha = rep(0.4, 1), cat.pos = c(340,330), cat.dist = rep(0.04, 1), cex =2, cat.cex=2.2,  ext.pos =140, ext.length= 0.70, ext.dist = 0.005)
+
+
+#since this function gives the graphs as grobs you cannot use plot()
+p1 <- grobTree(vennplot1)
+p2 <- grobTree(vennplot2)
+p3 <- grobTree(vennplot3)
+
+#pdf("C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/ev_isolation/output/script4/venndiagrams_databases_overlap.pdf", width = 18, height = 22, compress = FALSE)
+
+grid.arrange(p1, p2, p3, nrow=2 )
+
+#dev.off()
+
+```
+
+
+
+Plot the detected proteins per sample and group and show EV proteins (ESCRT_multivesicular and Vesicle pathways) or EVpedia top 100 and plasma proteins.
+```{r}
+
+#choose protien lists:
+choose_list <- list(c(GO_proteins[["vesicle_pathway"]], GO_proteins[["ESCRT_and_multivesicular"]]), proteinlist[["vesiclepdia top 100"]])
+names(choose_list) <- c("GO EV proteins", "Vesciplepedia top 100")
+
+x <- choose_list[[1]] #change to 1 or 2
+y <- names(choose_list[1]) #change to 1 or 2
+
+protein_groups <- ifelse(rownames(logcounts)%in%plasma_proteins, "plasma", 
+                ifelse(rownames(logcounts)%in%x, "ev", "others"))
+
+temp <- rowsum((logcounts>0)*1, protein_groups)
+temp_percentage <- t(t(temp)/colSums(temp))*100
+
+temp2 <- t(rowsum(t((logcounts>0)*1), paste(metadata$sample_type, metadata$sample_complete, sep = "_")))
+temp2[] <- apply(temp2, 2, as.logical)
+temp2 <- rowsum(temp2, protein_groups)
+temp2_percentage<- t(t(temp2)/colSums(temp2))*100
+
+#create an ordered dataframe because I want to change the orders of the bars in the plot below
+order_number <- c(2, 3, 1, 4, 5, 6, 7, 8, 10, 9, 11, 12, 14, 13)
+temp2_ordered <- rbind(temp2, order_number)
+temp2_ordered <- temp2_ordered[,order(temp2_ordered[4,], decreasing = FALSE)]
+temp2_percentage_ordered<- rbind(temp2_percentage, order_number)
+temp2_percentage_ordered <- temp2_percentage_ordered[,order(temp2_percentage_ordered[4,], decreasing = FALSE)]
+
+
+#pdf(paste0("C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/ev_isolation/output/script4/EV_and_Plasma_2_", y, ".pdf"), width = 8, height = 15)
+
+mypar(5,2, mar=c(10, 3, 2, 2))
+
+barplot(temp[3:1,], las=2, cex.names = 0.7, col= c("sienna2", "paleturquoise3", "paleturquoise4"), ylab = "counts of proteins", main = y)
+barplot(temp_percentage[3:1,], las=2, cex.names = 0.7, col= c("sienna2", "paleturquoise3", "paleturquoise4"), ylab = "proteins present", main = y)
+
+barplot(temp2_ordered[3:1,], las=2, cex.names = 0.7, col= c("sienna2", "paleturquoise3", "paleturquoise4"), names.arg = sub(".*_", "", colnames(temp2_ordered)), ylab = "counts of proteins", main = y)
+barplot(temp2_percentage_ordered[3:1,], las=2, cex.names = 0.8, names.arg = sub(".*_", "", colnames(temp2_percentage_ordered)), col= c("sienna2", "paleturquoise3", "paleturquoise4"), ylab = "proteins present (%)", main = y)
+
+plot(0, type="n", axes=F, xlab="", ylab="")
+legend("topright", legend = c("EV proteins", "Other proteins", "Plasma proteins"), fill = c("paleturquoise4", "paleturquoise3", "sienna2") , bty = "n")
+
+#dev.off()
+
+
+#pdf(paste0("C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/ev_isolation/output/script4/EV_and_Plasma_ratio_", y, ".pdf"), width = 8, height = 4)
+
+mypar(1,2, mar = c(3, 9, 2, 2))
+
+min_temp <- min(log2(temp[1,]/temp[3,]))-1
+max_temp <- max(log2(temp[1,]/temp[3,]))+1
+
+min_temp2 <- min(log2(temp2_ordered[1,]/temp2_ordered[3,]))-1
+max_temp2 <- max(log2(temp2_ordered[1,]/temp2_ordered[3,]))+1
+
+barplot(rev(log2(temp[1,]/temp[3,])), las=1, cex.names = 0.4, names.arg = rev(colnames(temp)), xlab = "log2 fold change", col = "paleturquoise3", horiz = TRUE, xlim = c(min_temp, max_temp), main = y)
+#abline(v=1.5, col="sienna2")
+barplot(rev(log2(temp2_ordered[1,]/temp2_ordered[3,])), las=1, cex.names = 0.9, names.arg = sub(".*_", "", rev(colnames(temp2_ordered))), xlab = "log2 fold change", col = "paleturquoise3", horiz = TRUE, xlim = c(min_temp2, max_temp2), main = y)
+#abline(v=1.5, col="sienna2")
+
+#dev.off()
+
+```
+
+
+
+Use the GO terms to see if certain samples are enriched
+```{r}
+
+#pdf("C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/ev_isolation/output/script4/GO_proteins_per_sample.pdf", width = 16, height =24)
+mypar(7,2, mar=c(12, 3, 2, 2))
+
+for (i in 1:length(GO_proteins)){
+
+protein_groups <- rownames(logcounts)%in%GO_proteins[[i]]
+temp_GO <- rowsum((logcounts>0)*1, protein_groups)
+temp_GO <- t(t(temp_GO)/colSums(temp_GO))*100
+
+temp_GO_2 <- t(rowsum(t((logcounts>0)*1), paste(metadata$sample_type, metadata$sample_complete, sep = "_")))
+temp_GO_2[] <- apply(temp_GO_2, 2, as.logical)
+temp_GO_2 <- rowsum(temp_GO_2, protein_groups)
+temp_GO_2 <- t(t(temp_GO_2)/colSums(temp_GO_2))*100
+
+barplot(temp_GO[2,], las=2, cex.names = 1, main = names(GO_proteins[i]), ylab = "proteins present (%)")
+barplot(temp_GO_2[2,], las=2, cex.names = 1, main = names(GO_proteins[i]), ylab = "proteins present (%)", names.arg = sub(".*_", "", colnames(temp_GO_2)))
+}
+#dev.off()
+
+```
+
+
+Make a heatplot to visualize the presence or absence of the GO proteins in each sample
+```{r}
+
+GO_cellular_matrix<- matrix(0, nrow = length(GO_proteins), ncol = length(levels(metadata$sample_complete)), dimnames = list(c(names(GO_proteins)), c(levels(as.factor(paste(metadata$sample_type, metadata$sample_complete, sep = "_"))))))
+
+for (i in 1:length(GO_proteins)){
+protein_groups <- rownames(logcounts)%in%GO_proteins[[i]]
+temp_GO <- t(rowsum(t((logcounts>0)*1), paste(metadata$sample_type, metadata$sample_complete, sep = "_")))
+temp_GO[] <- apply(temp_GO, 2, as.logical)
+temp_GO <- rowsum(temp_GO, protein_groups)
+GO_cellular_matrix[names(GO_proteins[i]),] <- temp_GO[2,]
+temp_name <- colnames(GO_cellular_matrix)
+
+}
+
+order_number <- c(2, 3, 1, 4, 5, 6, 7, 8, 10, 9, 11, 12, 14, 13)
+GO_cellular_matrix_ordered <- rbind(GO_cellular_matrix, order_number)
+GO_cellular_matrix_ordered <- GO_cellular_matrix_ordered[,order(GO_cellular_matrix_ordered[11,], decreasing = FALSE)]
+
+GO_cellular_matrix_ordered_plasma <- GO_cellular_matrix_ordered[1:10,1:8] 
+GO_cellular_matrix_ordered_supernatant <- GO_cellular_matrix_ordered[1:10,9:14]
+
+plasma_pre <- heatmap(GO_cellular_matrix_ordered_plasma, Colv = NA, Rowv = NA, scale = "column", col = colorRampPalette(brewer.pal(20, "OrRd"))(99), labCol =  sub(".*_", "", colnames(GO_cellular_matrix_ordered_plasma)), margins = c(16,14), cexCol = 1.2, cexRow = 1.3)
+
+mm6_pre<- heatmap(GO_cellular_matrix_ordered_supernatant, Colv = NA, Rowv = NA, scale = "column", col = colorRampPalette(brewer.pal(6, "OrRd"))(99), labCol =  sub(".*_", "", colnames(GO_cellular_matrix_ordered_supernatant)), margins = c(16,14), cexCol = 1.2, cexRow = 1.3)
+
+#pdf("C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/ev_isolation/output/script4/enrichemnts_cell_compartments_heatmap_3.pdf", width = 8, height = 5)
+
+heatmap(GO_cellular_matrix_ordered_plasma, Colv = NA, Rowv = NA, scale = "none",   col = colorRampPalette(brewer.pal(20, "OrRd"))(99), labCol =  sub(".*_", "", colnames(GO_cellular_matrix_ordered_plasma)), margins = c(16,14), cexCol = 1.2, cexRow = 1.3)
+
+heatmap(GO_cellular_matrix_ordered_supernatant, Colv = NA, Rowv = NA, scale = "none", col = colorRampPalette(brewer.pal(6, "OrRd"))(99), labCol =  sub(".*_", "", colnames(GO_cellular_matrix_ordered_supernatant)), margins = c(16,14), cexCol = 1.2, cexRow = 1.3)
+
+#dev.off()
+
+```
+
+
+
+
+

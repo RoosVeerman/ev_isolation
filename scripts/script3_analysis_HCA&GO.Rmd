@@ -1,0 +1,265 @@
+---
+title: "proteomic_analysis_HCA&GO"
+author: "Roos"
+date: "19 May 2020"
+output: html_document
+---
+
+
+Start packages
+```{r}
+library(devtools)
+library(rafalib)
+library(readxl)
+library(dplyr)
+library(DESeq2)
+library(pvclust)
+library(pheatmap)
+library(colorspace)
+library(enrichR)
+
+```
+
+
+
+Read in files, only the tab that has the quantified data
+```{r}
+
+#import data & metadata
+data <- read_excel("C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/data/EV_GeneCentricData_20200429.xlsx", sheet = 1, col_types = c(rep("text", times=4) , rep("numeric", times=46) ))
+
+metadata <- read.csv("C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/data/metadata_script2.csv", header = TRUE, stringsAsFactors = TRUE)
+metadata <- droplevels(metadata[metadata$sample_fraction=="EV_fraction",])
+rownames(metadata) <- metadata$sample_name
+
+#clean up data table
+data1 <- data[, c(-1,-3,-4)]
+data1 <- as.data.frame(data1)
+
+#For the rest of the analysis I've removed the flow through samples as they are not EV isolation methods. Also I have removed the batch 10 & 11 from the ExoEasy MM6 samples as they were just there to test for batch effect (script 1, PCA)
+
+colnames(data1)
+removecol <- c("_3ml_Plasma_Izon35FT_ERH_S29.raw_MS1 precursor area", "_3ml_Plasma_Izon35FT_OB_S28.raw_MS1 precursor area", "_3ml_Plasma_IzonFT_ERH_S24.raw_MS1 precursor area", "_3ml_Plasma_IzonFT_JGH_S25.raw_MS1 precursor area", "_MM6_Izon35FT_S46.raw_MS1 precursor area", "_MM6_Izon35FT_S47.raw_MS1 precursor area", "_MM6_IzonFT_S42.raw_MS1 precursor area", "_MM6_IzonFT_S43.raw_MS1 precursor area" , "_MM6_exoEasy_S34.raw_MS1 precursor area", "_MM6_exoEasy_S35.raw_MS1 precursor area", "Antal")
+
+data2 <- data1[, !(colnames(data1)%in%removecol)]
+colnames(data2)
+
+#check for duplications in Gene Name and if any, remove the lowest expressed ones
+if(any(duplicated(data2$`Gene Name`))) {
+ duprow <- which(duplicated(data2$`Gene Name`))
+ duprow <- data2[duprow, "Gene Name"]
+ duprowtable <-data2[data2$`Gene Name`%in%duprow,]
+ duprowtable[,"total_peak"] <- rowSums(as.matrix(duprowtable[,-1]), na.rm = TRUE)
+}
+
+#There are 2 duplicates, keep row 1610 and 1914 and remove 1228 and 1751
+data2 <- data2[c(-1228, -1751),]
+data2 <- data.frame(data2[,-1], row.names =data2$`Gene Name`)
+
+
+#check if there is any NA in the data,if so replace with 0, also check if there are rows that have 0 for every sample, since we removed some samples now, these are not neccessary anymore.
+apply(data2, 2, function(x) any(is.na(x)))
+data2[is.na(data2)] <- 0
+
+data2<- data2[rowSums(data2[,-1])>0,]
+length(rownames(data1))
+length(rownames(data2))
+
+
+#make sure sample names in metadata and data are the same
+colnames(data2) <- metadata$sample_name
+
+```
+
+
+Make count matrix and normalize data (log2 transformation)
+```{r}
+
+allproteins <- rownames(data2)
+
+#make count table with protein names
+counts <- as.matrix(data2)
+                          
+counts <- counts[!is.na(rownames(counts)),] # remove any NA's in the row names
+counts <- counts[ sort(rownames(counts)), ] # sort proteins names (rownames) alphabetically
+dim(counts)            
+hist(counts)
+
+#Remove proteins that are expressed in only 1 sample (so cut-off is at present in at least 2 samples)
+sel <- apply(counts, 1, function(x) {sum(x>=5)>=2})
+counts <- counts[sel,]
+dim(counts)  
+hist(counts)
+allproteins <- rownames(counts)
+
+#log normalize counts
+logcounts <- log2(counts+1)
+hist(logcounts)
+
+mypar(1,1)
+
+boxplot( t(logcounts[1:50,]) , ylim=c(-4,60), las=2 , col="grey" , main="log norm" ,cex=.2)
+abline(h=0, col="red" ,lty=2)
+
+```
+
+
+Make 2 seperate dataframes for plasma and supernanant samples
+```{r}
+logcounts_sep <- list()
+
+for (i in levels(metadata$sample_type)) {
+temp_names <- droplevels(metadata[metadata$sample_type==i, "sample_name"])  
+temp <- logcounts[,colnames(logcounts)%in%temp_names]
+sel2 <- apply(temp, 1, function(x) {sum(x>=1)>=1})   #temp <- temp[rowSums(temp)>1,]
+temp <- temp[sel2,]
+logcounts_sep[[i]] <- temp
+
+}
+
+#Check the distributions
+mypar(2,2)
+hist(logcounts_sep[["plasma"]], main="plasma")
+hist(logcounts_sep[["supernatant"]], main="supernatant")
+
+boxplot( t(logcounts_sep[["plasma"]][1:50,]) , ylim=c(-4,60), las=2 , col="grey" , main="log plasma" ,cex=.2)
+abline(h=0, col="red" ,lty=2)
+
+boxplot( t(logcounts_sep[["supernatant"]][1:50,]) , ylim=c(-4,60), las=2 , col="grey" , main="log MM6" ,cex=.2)
+abline(h=0, col="red" ,lty=2)
+
+```
+
+
+
+HCA 
+```{r}
+
+heatmap_meta <- list()
+
+for (i in levels(metadata$sample_type)) {
+heatmap_meta[[i]] <- data.frame(metadata[metadata$sample_type==i, "isolation_method"], metadata[metadata$sample_type==i, "sample_volume"], row.names = colnames(logcounts_sep[[i]])) 
+colnames(heatmap_meta[[i]]) <- c("Isolation_method", "Sample_volume")
+}
+
+#create the color palettes for the annotations
+colourscheme <- (c("skyblue4", "skyblue3", "orangered2", "lightgoldenrod2", "darkseagreen4", "darkseagreen3", "sienna1", "plum3", "plum 1"))
+
+pal1 <- colourscheme
+pal2 <- sequential_hcl(10, palette = "Mint")
+pal3 <- (c("aquamarine3",  "tomato3", "cadetblue", "azure3", "darkolivegreen3", "lightpink2", "navajowhite2", "steelblue4"))
+
+#make annotation for the columns
+heatmap_ann <- list(
+  Isolation_method= c(exoEasy = pal1[2], ExoQuick = pal1[3], "Izon 35" = pal1[4], "Izon 70" =pal1[6], OptiPrep = pal1[9], MagCapture = pal1[7]),
+  Sample_volume= c("250 ul"=pal2[1], "3 ml"=pal2[5], "60 ml"= pal2[3]))
+
+#clustering_method <- c("ward.D2", "")
+
+
+#pdf(file="C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/ev_isolation/output/script3/heatmap_plasma_nocluster.pdf", width = 8, height = 8, compress = FALSE)
+
+cl_plasma <- pheatmap( logcounts_sep[["plasma"]], clustering_method = "ward.D2", cellheight= 0.6, scale = "row" , color = c("pink",colorRampPalette(c( "navy", "navy","white","orange", "firebrick"))(99)), border_color = NA, cluster_cols = T, cutree_rows = 7, cex=1,  fontsize_col = 10, show_rownames = FALSE, annotation_col=heatmap_meta[["plasma"]], annotation_colors= heatmap_ann, treeheight_col = 30 )
+
+#dev.off()
+
+
+#pdf(file="C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/ev_isolation/output/script3/heatmap_mm6_nocluster.pdf", width = 8, height = 8, compress = FALSE)
+
+cl_mm6 <- pheatmap( logcounts_sep[["supernatant"]], clustering_method = "ward.D2", cellheight= 0.25, scale = "row" , color = c("pink", colorRampPalette(c("navy", "navy","white","orange", "firebrick"))(99)), border_color = NA, cluster_cols = T, cutree_rows = 7, cex=1, fontsize_col = 9, show_rownames = FALSE, annotation_col=heatmap_meta[["supernatant"]], annotation_colors = heatmap_ann, treeheight_col = 12)
+
+#dev.off()
+
+
+#Get the proteins in the clusters
+gene_clusters_plasma <- cutree(cl_plasma$tree_row, k = 7)
+gene_clusters_mm6 <- cutree(cl_mm6$tree_row, k = 7)
+
+cl_plasma_sep <- list()
+cl_mm6_sep <- list()
+
+for (k in levels(factor(gene_clusters_plasma))) {
+cl_plasma_sep[[paste("cluster", k, sep = "_")]]<- names(gene_clusters_plasma[gene_clusters_plasma==k])
+}
+
+for (h in levels(factor(gene_clusters_mm6))) {
+cl_mm6_sep[[paste("cluster", h, sep = "_")]]<- names(gene_clusters_mm6[gene_clusters_mm6==h])
+}
+
+head(logcounts[cl_mm6_sep[[1]],])
+
+#make annotation for the rows, this is based on the amount of clusters you choose! (so if you change cutree_rows also change here)
+cluster_n <- list()
+cluster_n[["plasma"]]<- data.frame(cluster_plasma=factor(gene_clusters_plasma) , row.names = names(gene_clusters_plasma) )
+cluster_n[["supernatant"]] <- data.frame(cluster_mm6=factor(gene_clusters_mm6) , row.names = names(gene_clusters_mm6) )
+
+#update the annotation colors with the row clusters
+heatmap_ann[["cluster_plasma"]] <- pal3[1:7]
+heatmap_ann[["cluster_mm6"]] <- pal3[1:7]
+names(heatmap_ann[["cluster_plasma"]]) <- levels(droplevels(cluster_n[["plasma"]][["cluster_plasma"]]))
+names(heatmap_ann[["cluster_mm6"]]) <- levels(droplevels(cluster_n[["supernatant"]][["cluster_mm6"]]))
+
+
+#Re-run heatmap now with the identified colors for the cluster
+
+
+cl_plasma_pre <- pheatmap( logcounts_sep[["plasma"]], clustering_method = "ward.D2", cellheight= 0.5, scale = "row" , color = c("pink",colorRampPalette(c( "navy", "navy","white","orange", "firebrick"))(99)), border_color = NA, cluster_cols = T, cutree_rows = 7, cex=1, fontsize_col = 10, show_rownames = FALSE, annotation_col=heatmap_meta[["plasma"]], annotation_row = cluster_n[["plasma"]], annotation_colors = heatmap_ann, treeheight_col = 30 )
+
+#pdf(file="C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/ev_isolation/output/script3/heatmap_plasma.pdf", width = 8, height = 10, compress = FALSE)
+
+cl_plasma <- pheatmap( logcounts_sep[["plasma"]], cellheight= 0.5, scale =  "none", cluster_rows =  cl_plasma_pre$tree_row, color = c("grey",colorRampPalette(c( "navy", "navy","white","orange", "firebrick"))(99)), border_color = NA, cluster_cols = T, cutree_rows = 7, cex=1, fontsize_col = 10, show_rownames = FALSE, annotation_col=heatmap_meta[["plasma"]], annotation_row = cluster_n[["plasma"]], annotation_colors = heatmap_ann, treeheight_col = 30)
+
+#dev.off()
+
+cl_mm6_pre <- pheatmap( logcounts_sep[["supernatant"]], clustering_method = "ward.D2", cellheight= 0.35, scale = "row" , color = c("pink", colorRampPalette(c("navy", "navy","white","orange", "firebrick"))(99)), border_color = NA, cluster_cols = T, cutree_rows = 7, cex=1, labels_col = paste(metadata$isolation_method[24:35], metadata$donor_code[24:35], sep = ", "), fontsize_col = 10, show_rownames = FALSE, annotation_col=heatmap_meta[["supernatant"]], annotation_row = cluster_n[["supernatant"]], annotation_colors = heatmap_ann, treeheight_col = 13)
+
+#pdf(file="C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/ev_isolation/output/script3/heatmap_mm6.pdf", width = 9, height = 10, compress = FALSE)
+
+cl_mm6 <- pheatmap( logcounts_sep[["supernatant"]], , cellheight= 0.35, cluster_rows = cl_mm6_pre$tree_row , color = c("grey", colorRampPalette(c("navy", "navy","white","orange", "firebrick"))(99)), border_color = NA, cluster_cols = T, cutree_rows = 7, cex=1, labels_col = paste(metadata$isolation_method[24:35], metadata$donor_code[24:35], sep = ", "), fontsize_col = 10, show_rownames = FALSE, annotation_col=heatmap_meta[["supernatant"]], annotation_row = cluster_n[["supernatant"]], annotation_colors = heatmap_ann, treeheight_col = 13)
+
+#dev.off()
+
+```
+
+
+Export the proteins from each cluster
+```{r}
+
+clusters_plasma_proteins <- do.call("rbind", lapply(cl_plasma_sep, FUN = as.data.frame))
+clusters_mm6_proteins <- do.call("rbind", lapply(cl_mm6_sep, FUN = as.data.frame))
+
+#write.csv(clusters_plasma_proteins, "C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/ev_isolation/output/script3/proteins_cluster_plasma.csv")
+#write.csv(clusters_mm6_proteins, "C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/ev_isolation/output/script3/proteins_cluster_supernatant.csv")
+
+
+```
+
+
+GO enrichment anlysis
+```{r}
+#choose the database you want to use
+listEnrichrDbs()
+
+#Make for each cluster a GO enrichment
+go_cluster_plasma <- sapply(cl_plasma_sep, function(x) { enrichr(genes = x, databases = "GO_Cellular_Component_2018")})
+go_cluster_mm6 <- sapply(cl_mm6_sep, function(x) { enrichr(genes = x, databases = "GO_Cellular_Component_2018")})
+
+
+pdf(file="C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/ev_isolation/output/script3/GO_plasma.pdf", width = 6, height = 16)
+mypar(7,1, mar = c(5, 18, 3, 2))
+for (q in 1:length(go_cluster_plasma)) {
+ barplot( -log10(go_cluster_plasma[[q]][["Adjusted.P.value"]][10:1]), horiz = T, names.arg = sub("\\(GO.*", "", go_cluster_plasma[[q]][["Term"]])[10:1],las=1, cex.names = 0.9, col = rev(pal2), main = sub(".G.*", "", names(go_cluster_plasma[q])), border = NA, xlab = "-log10 adjusted P value", space = 0.4)
+  }
+dev.off()
+
+
+pdf(file="C:/Users/rosvee/Documents/11. Isolation project/proteomic_analysis/ev_isolation/output/script3/GO_mm6.pdf", width =6, height = 16)
+mypar(7,1, mar = c(5, 18, 3, 2))
+for (q in 1:length(go_cluster_mm6)) {
+ barplot( -log10(go_cluster_mm6[[q]][["Adjusted.P.value"]][10:1]), horiz = T, names.arg = sub("\\(GO.*", "", go_cluster_mm6[[q]][["Term"]])[10:1],las=1, cex.names = 0.90, col = rev(pal2), main = sub(".G.*", "", names(go_cluster_mm6[q])), border = NA, xlab = "-log10 adjusted P value", space = 0.4)
+}
+
+dev.off()
+
+```
+
